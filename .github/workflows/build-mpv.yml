@@ -1,6 +1,7 @@
 # Add this file at .github/workflows/build-mpv.yml on the main branch.
-# Updated 2026-11-15: standard FFmpeg, minimal playback config, common-format tests.
-# Native macOS compilation has NOT yet been run.
+# Updated 2026-11-15: Node 24 actions and actionable verification failure reports.
+# checkout v7.0.1; upload-artifact v7.0.2; both pinned to their release commits.
+# Native macOS compilation succeeded in run 43725277704; verification still failed.
 name: Construire mpv pour Mac Apple Silicon
 'on':
   workflow_dispatch: null
@@ -22,7 +23,7 @@ jobs:
         shell: bash
     steps:
     - name: Lire le depot
-      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - name: Preparer le Mac GitHub et les dependances
       run: |
         set -euo pipefail
@@ -251,18 +252,31 @@ jobs:
         set -euo pipefail
         python3 - <<'PY'
         from pathlib import Path
-        import os, re, subprocess
+        import os, re, subprocess, sys, traceback
 
         mpv = str(Path('work/mpv.app/Contents/MacOS/mpv').resolve())
         reports = Path('work/reports')
         fixtures = Path('work/fixtures')
         fixtures.mkdir(exist_ok=True)
+        def report_failure(kind, error, trace):
+            # Preserve the precise test failure in the public annotation and run summary.
+            detail = ''.join(traceback.format_exception(kind, error, trace))
+            (reports / 'verification-failure.txt').write_text(detail)
+            message = str(error)[-6000:]
+            escaped = message.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+            print('::error title=Echec des verifications mpv::' + escaped, flush=True)
+            summary = os.environ.get('GITHUB_STEP_SUMMARY')
+            if summary:
+                with open(summary, 'a') as stream:
+                    stream.write('\n### Verification mpv interrompue\n\n```text\n' + detail[-12000:] + '\n```\n')
+            sys.__excepthook__(kind, error, trace)
+        sys.excepthook = report_failure
         def run(args, log=None, env=None):
             result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180, env=env)
             if log:
                 log.write_text(result.stdout)
             if result.returncode:
-                raise RuntimeError(f'Command failed: {args}\n{result.stdout[-12000:]}')
+                raise RuntimeError(f'Command failed (exit {result.returncode}): {args}\n{result.stdout[-12000:]}')
             return result.stdout
         clean = dict(os.environ, PATH='/usr/bin:/bin:/usr/sbin:/sbin')
         for key in list(clean):
@@ -448,7 +462,7 @@ jobs:
         printf '\nApp candidate: mpvmacs-arm64.zip. Ad-hoc signature; not notarized.\n' >> "$GITHUB_STEP_SUMMARY"
     - name: Conserver les journaux, meme en cas dechec
       if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: journaux-mpvmacs
         path: |-
@@ -457,7 +471,7 @@ jobs:
         if-no-files-found: warn
         retention-days: 7
     - name: Fournir le candidat application
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: mpvmacs-arm64
         path: dist/
