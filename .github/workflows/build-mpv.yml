@@ -1,0 +1,465 @@
+# Add this file at .github/workflows/build-mpv.yml on the main branch.
+# Updated 2026-11-15: standard FFmpeg, minimal playback config, common-format tests.
+# Native macOS compilation has NOT yet been run.
+name: Construire mpv pour Mac Apple Silicon
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
+concurrency:
+  group: mpvmacs-build
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      HOMEBREW_NO_ANALYTICS: '1'
+      HOMEBREW_NO_ENV_HINTS: '1'
+      MACOSX_DEPLOYMENT_TARGET: '26.0'
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Lire le depot
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+    - name: Preparer le Mac GitHub et les dependances
+      run: |
+        set -euo pipefail
+        test "$(uname -s)" = Darwin
+        test "$(uname -m)" = arm64
+        mkdir -p work/reports dist
+        sw_vers > work/reports/macos.txt
+        xcodebuild -version > work/reports/xcode.txt
+        xcrun --sdk macosx --show-sdk-version >> work/reports/xcode.txt
+        brew update
+        # Use the packaged stable FFmpeg; no custom FFmpeg build or extra codec plugins.
+        brew install meson ninja pkgconf python ffmpeg libass libplacebo molten-vk \
+          vulkan-loader vulkan-headers luajit mujs little-cms2 libarchive libbluray \
+          libdvdnav libdvdread libcdio-paranoia rubberband uchardet zimg curl
+        brew config > work/reports/homebrew.txt
+        brew list --versions > work/reports/dependency-versions.txt
+        brew info --json=v2 --installed > work/reports/homebrew-manifest.json
+        printf 'PKG_CONFIG_PATH=%s/lib/pkgconfig:%s/lib/pkgconfig:%s/lib/pkgconfig:%s/lib/pkgconfig\n' \
+          "$(brew --prefix ffmpeg)" "$(brew --prefix libarchive)" \
+          "$(brew --prefix curl)" "$(brew --prefix)" >> "$GITHUB_ENV"
+        printf '%s/bin\n' "$(brew --prefix ffmpeg)" >> "$GITHUB_PATH"
+    - name: Recuperer mpv 0.42.0 et deux correctifs audio cibles
+      run: |
+        set -euo pipefail
+        git init work/mpv
+        git -C work/mpv remote add origin https://github.com/mpv-player/mpv.git
+        base=b0841e8c4d156b8403dc1876c4cbd9011eb583f3
+        git -C work/mpv fetch --depth=1 origin "$base"
+        git -C work/mpv checkout --detach FETCH_HEAD
+        test "$(git -C work/mpv rev-parse HEAD)" = "$base"
+        git -C work/mpv fetch --depth=1 origin tag v0.42.0
+        test "$(git -C work/mpv rev-parse 'v0.42.0^{}')" = "$base"
+        printf 'mpv 0.42.0 base: %s\n' "$base" > work/reports/source-revisions.txt
+        for revision in \
+          5a5d2f5e9d53751b42b65c5d0e38b687acfa3bfb \
+          bb4823e5f0eb92a830242e60dfdcc50d1f2e0410; do
+          git -C work/mpv fetch --depth=2 origin "$revision"
+          test "$(git -C work/mpv rev-parse FETCH_HEAD)" = "$revision"
+          git -C work/mpv show --format= --binary "$revision" > "work/$revision.patch"
+          git -C work/mpv apply --check "../$revision.patch"
+          git -C work/mpv apply "../$revision.patch"
+          git -C work/mpv show -s --format='%H %s' "$revision" >> work/reports/source-revisions.txt
+        done
+        git -C work/mpv diff --binary > work/reports/applied-fixes.patch
+    - name: Compiler, executer les tests et creer mpv.app
+      run: |
+        set -euo pipefail
+        # Reject an unintended FFmpeg installation selected through pkg-config.
+        python3 - <<'PY'
+        from pathlib import Path
+        import subprocess
+        def output(*args):
+            return subprocess.check_output(args, text=True).strip()
+        expected = Path(output('brew', '--prefix', 'ffmpeg')).resolve()
+        for library in ['libavcodec', 'libavformat', 'libavfilter', 'libavutil',
+                        'libavdevice', 'libswscale', 'libswresample']:
+            actual = Path(output('pkg-config', '--variable=prefix', library)).resolve()
+            if actual != expected:
+                raise SystemExit(f'Unexpected FFmpeg dependency: {library}: {actual}')
+        PY
+        ffmpeg -hide_banner -version > work/reports/ffmpeg-version.txt 2>&1
+        ffmpeg -hide_banner -buildconf > work/reports/ffmpeg-buildconf.txt 2>&1
+        ffmpeg -hide_banner -demuxers > work/reports/ffmpeg-demuxers.txt 2>&1
+        ffmpeg -hide_banner -protocols > work/reports/ffmpeg-protocols.txt 2>&1
+        meson setup work/mpv/build work/mpv \
+          --buildtype=release --wrap-mode=nodownload \
+          -Dlibmpv=true -Dtests=true -Dmanpage-build=disabled \
+          -Dcocoa=enabled -Dswift-build=enabled -Dmacos-media-player=enabled \
+          -Dcoreaudio=enabled -Davfoundation=enabled \
+          -Dvulkan=enabled -Dvideotoolbox-pl=enabled \
+          -Dgl=enabled -Dgl-cocoa=enabled -Dvideotoolbox-gl=enabled -Dmacos-cocoa-cb=enabled \
+          -Dlua=luajit -Djavascript=enabled -Dlcms2=enabled \
+          -Dlibarchive=enabled -Dlibbluray=enabled -Ddvdnav=enabled -Ddvda=enabled \
+          -Dcdda=enabled -Dlibavdevice=enabled -Dlibcurl=enabled \
+          -Drubberband=enabled -Duchardet=enabled -Dzimg=enabled
+        meson compile -C work/mpv/build -j3
+        meson test -C work/mpv/build --print-errorlogs
+        meson compile -C work/mpv/build macos-bundle
+        ditto work/mpv/build/mpv.app work/mpv.app
+        cp work/mpv/build/config.h work/reports/config.h
+        cp work/mpv/build/meson-logs/testlog.txt work/reports/meson-tests.txt
+        meson introspect --buildoptions work/mpv/build > work/reports/build-options.json
+        python3 - <<'PY'
+        import pathlib, re
+        config = pathlib.Path('work/reports/config.h').read_text()
+        for feature in ['COCOA', 'SWIFT', 'VULKAN', 'VIDEOTOOLBOX_PL', 'AVFOUNDATION', 'COREAUDIO']:
+            if not re.search(r'^#define HAVE_' + feature + r'\s+1\s*$', config, re.M):
+                raise SystemExit('Required feature missing: ' + feature)
+        PY
+    - name: Configurer Metal et compiler le diagnostic Apple
+      run: |
+        set -euo pipefail
+        cat > work/mpv.app/Contents/Resources/mpv.conf <<'CONF'
+        # mpvmacs: Metal through MoltenVK; VideoToolbox with software fallback.
+        player-operation-mode=pseudo-gui
+        vo=gpu-next
+        gpu-api=vulkan
+        gpu-context=macvk
+        hwdec=videotoolbox,videotoolbox-copy
+        hwdec-software-fallback=yes
+        ao=coreaudio,avfoundation
+        target-colorspace-hint=yes
+        # Keep mpv's default codec allowlist, scalers and tone-mapping settings.
+        CONF
+        cat > work/hardware.swift <<'SWIFT'
+        import Foundation
+        import AppKit
+        import Metal
+        import VideoToolbox
+        import CoreMedia
+        import CoreVideo
+        import AVFoundation
+
+        let codecs: [(String, CMVideoCodecType)] = [
+            ("H.264", kCMVideoCodecType_H264), ("HEVC", kCMVideoCodecType_HEVC),
+            ("H.263", kCMVideoCodecType_H263), ("MPEG-4", kCMVideoCodecType_MPEG4Video),
+            ("MPEG-2", kCMVideoCodecType_MPEG2Video), ("MPEG-1", kCMVideoCodecType_MPEG1Video)
+        ]
+        var report: [String: Any] = [
+            "macOS": ProcessInfo.processInfo.operatingSystemVersionString,
+            "metalDevice": MTLCreateSystemDefaultDevice()?.name ?? "unavailable",
+            "note": "Codec-level capability only; each file profile and actual playback still need testing."
+        ]
+        report["hardwareDecodeSupported"] = Dictionary(uniqueKeysWithValues:
+            codecs.map { ($0.0, VTIsHardwareDecodeSupported($0.1)) })
+        report["displays"] = NSScreen.screens.map { screen -> [String: Any] in
+            ["name": screen.localizedName,
+             "currentEDRHeadroom": Double(screen.maximumExtendedDynamicRangeColorComponentValue),
+             "potentialEDRHeadroom": Double(screen.maximumPotentialExtendedDynamicRangeColorComponentValue)]
+        }
+        let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+        print(String(decoding: data, as: UTF8.self))
+        SWIFT
+        xcrun swiftc -O -target arm64-apple-macosx26.0 work/hardware.swift \
+          -o work/mpv.app/Contents/MacOS/check-hardware
+        python3 - <<'PY'
+        from pathlib import Path
+        import plistlib
+        p = Path('work/mpv.app/Contents/Info.plist')
+        data = plistlib.loads(p.read_bytes())
+        data['CFBundleIdentifier'] = 'io.github.khaldivtc.mpvmacs'
+        data['LSMinimumSystemVersion'] = '26.0'
+        p.write_bytes(plistlib.dumps(data))
+        PY
+    - name: Verifier les dependances et signer le paquet
+      run: |
+        set -euo pipefail
+        cat > work/audit_bundle.py <<'PY'
+        from pathlib import Path
+        import json, re, subprocess, sys
+
+        app = Path(sys.argv[1]).resolve()
+        exe_dir = app / 'Contents/MacOS'
+        def run(*args):
+            return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT)
+        def system_path(s):
+            return s.startswith(('/System/Library/', '/usr/lib/'))
+        def commands(path):
+            libs, rpaths, kind = [], [], ''
+            for line in run('otool', '-l', str(path)).splitlines():
+                text = line.strip()
+                if text.startswith('cmd '):
+                    kind = text[4:]
+                if kind == 'LC_RPATH' and text.startswith('path '):
+                    rpaths.append(text[5:].split(' (offset ')[0])
+                if kind in ('LC_LOAD_DYLIB', 'LC_LOAD_WEAK_DYLIB', 'LC_REEXPORT_DYLIB', 'LC_LOAD_UPWARD_DYLIB') and text.startswith('name '):
+                    libs.append(text[5:].split(' (offset ')[0])
+            return libs, rpaths
+        def expand(value, obj):
+            return value.replace('@executable_path', str(exe_dir)).replace('@loader_path', str(obj.parent))
+        files = [p for p in app.rglob('*') if p.is_file() and 'Mach-O' in run('file', '-b', str(p))]
+        if not files:
+            raise SystemExit('No Mach-O binaries found')
+        # Remove build-machine search paths from every binary before final signing.
+        for obj in files:
+            for rp in commands(obj)[1]:
+                if rp.startswith('/') and not system_path(rp):
+                    subprocess.run(['install_name_tool', '-delete_rpath', rp, str(obj)], check=True)
+        main_rpaths = commands(exe_dir / 'mpv')[1]
+        links, report = [], []
+        for obj in files:
+            archs = run('lipo', '-archs', str(obj)).split()
+            if 'arm64' not in archs:
+                raise SystemExit(f'No ARM64 slice: {obj}')
+            deps, rpaths = commands(obj)
+            for dep in deps:
+                links.append(dep)
+                if system_path(dep):
+                    continue
+                if dep.startswith('@rpath/'):
+                    candidates = [expand(rp, obj) + '/' + dep[7:] for rp in rpaths]
+                    candidates += [expand(rp, exe_dir / 'mpv') + '/' + dep[7:] for rp in main_rpaths]
+                else:
+                    candidates = [expand(dep, obj)]
+                valid = False
+                for candidate in candidates:
+                    if system_path(candidate):
+                        valid = True  # Some system libraries live only in the dyld cache.
+                    else:
+                        path = Path(candidate).resolve()
+                        if path.is_file() and path.is_relative_to(app):
+                            valid = True
+                if not valid:
+                    raise SystemExit(f'External or unresolved dependency: {obj.name}: {dep}')
+            report.append({'file': str(obj.relative_to(app)), 'architectures': archs, 'dependencies': deps})
+        icd = app / 'Contents/Resources/vulkan/icd.d/MoltenVK_icd.json'
+        if not icd.is_file():
+            raise SystemExit('MoltenVK driver manifest is missing')
+        driver = (icd.parent / json.loads(icd.read_text())['ICD']['library_path']).resolve()
+        if not driver.is_file() or not driver.is_relative_to(app):
+            raise SystemExit('MoltenVK driver is not bundled')
+        for framework in ['VideoToolbox.framework', 'CoreVideo.framework', 'AVFoundation.framework', 'Metal.framework']:
+            if not any(framework in dep for dep in links):
+                raise SystemExit('Required framework not linked: ' + framework)
+        Path('work/reports/bundle-audit.json').write_text(json.dumps(report, indent=2))
+        for obj in files:
+            subprocess.run(['codesign', '--force', '--sign', '-', str(obj)], check=True)
+        subprocess.run(['codesign', '--force', '--sign', '-', str(app)], check=True)
+        subprocess.run(['codesign', '--verify', '--deep', '--strict', '--verbose=2', str(app)], check=True)
+        print(f'Checked {len(files)} Mach-O files: ARM64, bundled dependencies and ad-hoc signature.')
+        PY
+        python3 work/audit_bundle.py work/mpv.app
+        work/mpv.app/Contents/MacOS/check-hardware > work/reports/runner-hardware.json
+    - name: Verifier les decodeurs et la configuration
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        from pathlib import Path
+        import os, re, subprocess
+
+        mpv = str(Path('work/mpv.app/Contents/MacOS/mpv').resolve())
+        reports = Path('work/reports')
+        fixtures = Path('work/fixtures')
+        fixtures.mkdir(exist_ok=True)
+        def run(args, log=None, env=None):
+            result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180, env=env)
+            if log:
+                log.write_text(result.stdout)
+            if result.returncode:
+                raise RuntimeError(f'Command failed: {args}\n{result.stdout[-12000:]}')
+            return result.stdout
+        clean = dict(os.environ, PATH='/usr/bin:/bin:/usr/sbin:/sbin')
+        for key in list(clean):
+            if key.startswith(('DYLD_', 'VK_', 'MPV_')) or key == 'MPVBUNDLE':
+                clean.pop(key)
+        for flag, required in [('--version', ['libplacebo']), ('--vo=help', ['gpu-next']),
+                               ('--gpu-context=help', ['macvk']), ('--ao=help', ['coreaudio', 'avfoundation']),
+                               ('--hwdec=help', ['videotoolbox']),
+                               ('--vd=help', ['h264', 'hevc', 'h263', 'mpeg4', 'mpeg2video', 'mpeg1video', 'av1', 'vp9']),
+                               ('--ad=help', ['mp3', 'aac', 'flac', 'alac', 'opus', 'vorbis', 'ac3', 'eac3', 'dca']),
+                               ('--demuxer=help', ['lavf', 'mkv', 'playlist'])]:
+            name = flag.replace('--', '').replace('=', '-')
+            output = run([mpv, '--no-config', flag], reports / (name + '.txt'), clean)
+            for item in required:
+                if item not in output:
+                    raise RuntimeError(f'{flag} does not contain required feature {item}')
+        # Synthetic fixtures validate decoder paths; HDR tags are not a color-calibration reference.
+        cases = [
+            ('h264', 'libx264', 'h264.mkv', []),
+            ('hevc', 'libx265', 'hevc-main10.mkv', ['-pix_fmt', 'yuv420p10le']),
+            ('h263', 'h263', 'h263.avi', []),
+            ('mpeg4', 'mpeg4', 'mpeg4.avi', []),
+            ('mpeg2video', 'mpeg2video', 'mpeg2.mpg', []),
+            ('mpeg1video', 'mpeg1video', 'mpeg1.mpg', []),
+            ('hevc', 'libx265', 'hdr10.mkv', ['-pix_fmt', 'yuv420p10le', '-color_primaries', 'bt2020',
+                '-color_trc', 'smpte2084', '-colorspace', 'bt2020nc', '-x265-params',
+                'pools=1:frame-threads=1:colorprim=9:transfer=16:colormatrix=9:hdr10=1:repeat-headers=1:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50):max-cll=1000,400']),
+            ('hevc', 'libx265', 'hlg.mkv', ['-pix_fmt', 'yuv420p10le', '-color_primaries', 'bt2020',
+                '-color_trc', 'arib-std-b67', '-colorspace', 'bt2020nc', '-x265-params',
+                'pools=1:frame-threads=1:colorprim=9:transfer=18:colormatrix=9']),
+        ]
+        import json
+        for codec, encoder, filename, extra in cases:
+            fixture = fixtures / filename
+            args = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i',
+                    'testsrc2=size=352x288:rate=25', '-frames:v', '25', '-an', '-c:v', encoder]
+            if encoder in ('libx264', 'libx265'):
+                args += ['-preset', 'ultrafast']
+            if encoder == 'libx265' and '-x265-params' not in extra:
+                args += ['-x265-params', 'pools=1:frame-threads=1']
+            run(args + extra + [str(fixture)], reports / (filename + '-encode.txt'))
+            data = json.loads(run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_streams', '-of', 'json', str(fixture)]))
+            stream = data['streams'][0]
+            if stream['codec_name'] != codec:
+                raise RuntimeError('Wrong codec in ' + filename)
+            if filename in ('hevc-main10.mkv', 'hdr10.mkv', 'hlg.mkv') and stream['pix_fmt'] != 'yuv420p10le':
+                raise RuntimeError('10-bit test fixture is not 10-bit: ' + filename)
+            transfer = {'hdr10.mkv': 'smpte2084', 'hlg.mkv': 'arib-std-b67'}.get(filename)
+            if transfer and stream.get('color_transfer') != transfer:
+                raise RuntimeError('HDR transfer metadata missing: ' + filename)
+            output = run([mpv, '--no-config', '--hwdec=no', '--vo=null', '--ao=null', '--untimed',
+                          '--frames=25', '--msg-level=all=info', str(fixture)], reports / (filename + '-decode.txt'), clean)
+            if 'VO: [null]' not in output:
+                raise RuntimeError('No decoded video reached the null output: ' + filename)
+        # Reuse the H.264 fixture to exercise the MP4 container as well as Matroska.
+        run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(fixtures / 'h264.mkv'),
+             '-map', '0:v:0', '-c:v', 'copy', str(fixtures / 'h264.mp4')])
+        output = run([mpv, '--no-config', '--hwdec=no', '--vo=null', '--ao=null', '--untimed',
+                      '--frames=25', str(fixtures / 'h264.mp4')], reports / 'mp4-decode.txt', clean)
+        if 'VO: [null]' not in output:
+            raise RuntimeError('MP4 video decoding did not initialize')
+
+        for encoder, filename, codec in [('libmp3lame', 'audio.mp3', 'mp3'),
+                                          ('aac', 'audio.m4a', 'aac'),
+                                          ('flac', 'audio.flac', 'flac')]:
+            fixture = fixtures / filename
+            run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i',
+                 'sine=frequency=440:duration=1', '-c:a', encoder, str(fixture)])
+            data = json.loads(run(['ffprobe', '-v', 'error', '-select_streams', 'a:0',
+                                  '-show_streams', '-of', 'json', str(fixture)]))
+            if data['streams'][0]['codec_name'] != codec:
+                raise RuntimeError('Wrong audio codec in ' + filename)
+            output = run([mpv, '--no-config', '--ao=null', '--vo=null', str(fixture)],
+                         reports / (filename + '-decode.txt'), clean)
+            if 'AO: [null]' not in output:
+                raise RuntimeError('Audio decoding did not initialize: ' + filename)
+
+        # This observer is only a build test; it is not installed in the application.
+        observer = fixtures / 'check-subtitles.lua'
+        observer.write_text('mp.observe_property("sub-text", "string", function(_, text)\n'
+                            '  if text and text:find("MPVMACS_SUBTITLE_OK", 1, true) then\n'
+                            '    mp.msg.info("MPVMACS_SUBTITLE_DECODED")\n'
+                            '  end\nend)\n')
+        srt = fixtures / 'subtitles.srt'
+        srt.write_text('1\n00:00:00,000 --> 00:00:01,000\nMPVMACS_SUBTITLE_OK\n\n')
+        for extension, codec in [('srt', None), ('ass', 'ass'), ('vtt', 'webvtt')]:
+            subtitle = fixtures / ('subtitles.' + extension)
+            if codec:
+                run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(srt),
+                     '-c:s', codec, str(subtitle)])
+            output = run([mpv, '--no-config', '--hwdec=no', '--vo=null', '--ao=null', '--audio=no',
+                          '--sub-auto=no', '--sid=1', '--sub-file=' + str(subtitle.resolve()),
+                          '--script=' + str(observer.resolve()), str(fixtures / 'h264.mp4')],
+                         reports / (extension + '-subtitle.txt'), clean)
+            if 'MPVMACS_SUBTITLE_DECODED' not in output:
+                raise RuntimeError('Subtitle text was not decoded: ' + extension)
+        # Parse the shipped configuration without depending on a VM display or audio device.
+        run([mpv, '--no-config', '--include=' + str(Path('work/mpv.app/Contents/Resources/mpv.conf').resolve()),
+             '--idle=no', '--force-window=no', '--vo=null', '--ao=null', '--hwdec=no',
+             '--frames=2', str(fixtures / 'h264.mkv')], reports / 'config-smoke.txt', clean)
+        (reports / 'VALIDATION.txt').write_text(
+            'PASS: upstream Meson tests, required build features, ARM64 slices, dependency audit, ad-hoc codesign verification,\n'
+            'software-decoding smoke tests for H.264, HEVC Main10, H.263, MPEG-4, MPEG-2, MPEG-1, PQ/HDR10 and HLG metadata,\n'
+            'MP4 and Matroska containers, MP3/AAC/FLAC audio and SRT/ASS/WebVTT subtitle text.\n'
+            'Decoder inventories describe compiled capabilities, not successful playback of every format or profile.\n'
+            'NOT VALIDATED: physical M1 hardware decode, Metal rendering, visual HDR/HLG accuracy, audio devices, Finder integration,\n'
+            'Gatekeeper/notarization, macOS 27.2.1 runtime compatibility, long playback and thermal behavior.\n'
+            'Runner capability data does not describe the user Mac. This is a candidate build, not a certified final build.\n')
+        PY
+    - name: Creer les archives et leurs empreintes
+      run: |
+        set -euo pipefail
+        mkdir -p work/package/mpvmacs work/package/mpvmacs/Support work/package/mpvmacs/Licences
+        ditto work/mpv.app work/package/mpvmacs/mpv.app
+        ditto work/reports work/package/mpvmacs/Verification-GitHub
+        cp work/hardware.swift work/package/mpvmacs/Support/
+        cp work/mpv/LICENSE.GPL work/mpv/LICENSE.LGPL work/mpv/Copyright work/package/mpvmacs/Licences/
+        cp work/mpv/DOCS/man/options.rst work/package/mpvmacs/Support/options-mpv.rst
+        cat > work/package/mpvmacs/Verifier-mon-Mac.command <<'SH'
+        #!/bin/bash
+        set -euo pipefail
+        cd -- "$(dirname -- "$0")"
+        report="$PWD/Diagnostic-Mac-$(date +%Y%m%d-%H%M%S)-$$.txt"
+        {
+            /usr/bin/sw_vers
+            /usr/bin/uname -m
+            ./mpv.app/Contents/MacOS/check-hardware
+            ./mpv.app/Contents/MacOS/mpv --no-config --version
+        } > "$report" 2>&1
+        printf 'Rapport cree : %s\n' "$report"
+        /usr/bin/open -a TextEdit "$report"
+        SH
+        chmod +x work/package/mpvmacs/Verifier-mon-Mac.command
+        cat > work/package/mpvmacs/LIRE-AVANT.txt <<'TXT'
+        mpvmacs - candidat de compilation personnel ARM64
+
+        Ce paquet contient mpv.app avec ses bibliotheques non systeme embarquees.
+        La construction requiert macOS 26 ou plus recent. macOS 27.2.1 reste a tester sur le Mac cible.
+        Aucun Homebrew, Xcode ou Python n'est necessaire pour utiliser l'application terminee.
+        La configuration active gpu-next/Vulkan/MoltenVK (Metal) et VideoToolbox, avec repli logiciel.
+        AVFoundation est compile pour la sortie audio ; le lecteur reste fonde sur FFmpeg/libplacebo.
+        Les codecs anciens ne sont pas garantis en decodage materiel : le materiel Apple decide.
+        Le rendu HDR10/HLG est demande au systeme mais doit etre verifie sur l'ecran reel.
+        Le MacBook Air M1 a une dalle 400 nits, pas un ecran XDR. Le rendu depend de l'ecran et du systeme.
+
+        Cette version utilise FFmpeg standard, sans compilation FFmpeg personnalisee ni plugins de codecs.
+        Les filtres, le redimensionnement et la liste de codecs autorises pour VideoToolbox gardent
+        les valeurs par defaut de mpv. Aucun profil haute qualite supplementaire n'est impose.
+        Les listes vd-help.txt et ad-help.txt indiquent les decodeurs video et audio du lecteur compile.
+        ffmpeg-demuxers.txt et ffmpeg-protocols.txt decrivent la bibliotheque FFmpeg utilisee ;
+        ils ne constituent pas une garantie que chaque fonction est exposee ou testee dans mpv.
+        Les tests couvrent des exemples de fichiers courants, pas tous les formats de VLC.
+        MIDI, SID, musiques de consoles et sous-titres rares ne font l'objet d'aucun ajout specifique.
+
+        La signature est ad hoc : ce paquet n'est pas notarise par Apple.
+        Si macOS bloque l'ouverture, verifier la provenance puis utiliser le mecanisme d'ouverture
+        ponctuelle de Reglages Systeme > Confidentialite et securite. Ne pas desactiver Gatekeeper.
+
+        Premier essai : ouvrir mpv.app puis glisser un fichier video dans la fenetre.
+        Les reglages mpv personnels deja presents peuvent surcharger les reglages du paquet.
+        Pour un diagnostic de la machine, double-cliquer Verifier-mon-Mac.command.
+        Il ecrit uniquement un rapport a cote du script, sans envoyer de donnees.
+        Le rapport de GitHub concerne une machine virtuelle, pas le MacBook Air cible.
+
+        Consulter Verification-GitHub/VALIDATION.txt pour les controles passes et ceux restant a faire.
+        Tester encore : HDR10 et HLG reels, plein ecran, avance rapide, veille/reprise, changement
+        de sortie audio, sous-titres et lecture prolongee. Shift+i affiche les statistiques mpv.
+
+        Sources : https://github.com/mpv-player/mpv ; https://mpv.io/manual/stable/
+        Versions exactes et correctifs : Verification-GitHub/source-revisions.txt.
+        Dependances : Verification-GitHub/homebrew-manifest.json et dependency-versions.txt.
+        mpv est compile depuis une revision fixe ; les dependances Homebrew sont les versions
+        disponibles au moment du lancement. Cette recette n'est pas une reconstruction bit-a-bit.
+        Ce paquet vise un usage personnel. Avant redistribution, reunir et fournir les sources
+        correspondantes et notices requises par les licences de toutes les bibliotheques embarquees.
+        TXT
+        # Keep the exact patched player source with the build recipe for inspection.
+        cp .github/workflows/build-mpv.yml work/package/mpvmacs/Support/build-mpv.yml
+        tar -czf dist/mpv-source-with-fixes.tar.gz --exclude=.git --exclude=build -C work mpv
+        ditto -c -k --sequesterRsrc --keepParent work/package/mpvmacs dist/mpvmacs-arm64.zip
+        shasum -a 256 dist/mpvmacs-arm64.zip dist/mpv-source-with-fixes.tar.gz > dist/SHA256SUMS.txt
+        cat work/reports/VALIDATION.txt >> "$GITHUB_STEP_SUMMARY"
+        printf '\nApp candidate: mpvmacs-arm64.zip. Ad-hoc signature; not notarized.\n' >> "$GITHUB_STEP_SUMMARY"
+    - name: Conserver les journaux, meme en cas dechec
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: journaux-mpvmacs
+        path: |-
+          work/reports/
+          work/mpv/build/meson-logs/
+        if-no-files-found: warn
+        retention-days: 7
+    - name: Fournir le candidat application
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: mpvmacs-arm64
+        path: dist/
+        if-no-files-found: error
+        retention-days: 7
